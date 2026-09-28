@@ -1,0 +1,96 @@
+name: Windows Lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-lab:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0 -Force
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Restart-Service -Name TermService -Force
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+            throw "TAILSCALE_AUTH_KEY is not configured."
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $ts up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          $ip = $null
+          for ($i = 0; $i -lt 12; $i++) {
+            $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+            if ($ip) { break }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $ip) {
+            throw "Tailscale IPv4 address was not assigned."
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
+
+      - name: Check RDP locally
+        shell: powershell
+        run: |
+          $result = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+            throw "RDP port 3389 is not listening."
+          }
+
+          Write-Host "RDP is listening locally."
+
+      - name: Publish connection info to job summary
+        shell: powershell
+        run: |
+          @"
+          ## Windows Lab
+
+          - Tailscale IP: `$env:TAILSCALE_IP`
+          - RDP port: `3389`
+          - Runner: `$env:RUNNER_NAME`
+
+          Connect from your mobile RDP client over your Tailscale network.
+
+          **Credentials are intentionally not printed or sent to Telegram.**
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Keep lab alive
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "Windows lab active: $(Get-Date)"
+            Start-Sleep -Seconds 300
+          }
